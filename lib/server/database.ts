@@ -1,5 +1,5 @@
 import "server-only";
-import type { RowStatement } from "snowflake-sdk";
+import type { Connection, Pool, RowStatement } from "snowflake-sdk";
 export type Rows = Record<string, unknown>[];
 export type Query = (sql: string, binds?: (string | number | null)[]) => Promise<Rows>;
 export const backendEnabled = () => process.env.SNOWFLAKE_BACKEND_ENABLED === "true";
@@ -8,12 +8,21 @@ export function databasePrefix() {
   if (!names.every(v => /^[a-z_][a-z0-9_]*$/i.test(v))) throw new Error("Invalid database configuration.");
   return names.map(v=>v.toUpperCase()).join(".");
 }
-export async function withDatabase<T>(work: (query: Query) => Promise<T>): Promise<T> {
+// Opening a Snowflake session costs seconds; a warm pool makes each request just its queries.
+const poolState = globalThis as typeof globalThis & { terplinkPool?: Promise<Pool<Connection>>; terplinkReadySessions?: WeakSet<Connection> };
+const readySessions = poolState.terplinkReadySessions ||= new WeakSet();
+function pool() {
   const e = process.env;
   if (!e.SNOWFLAKE_ACCOUNT || !e.SNOWFLAKE_USERNAME || !e.SNOWFLAKE_APP_TOKEN || !e.SNOWFLAKE_WAREHOUSE || !e.SNOWFLAKE_APP_ROLE || !e.SESSION_SECRET || e.SESSION_SECRET.length < 32) throw new Error("Database is not configured.");
-  const { default: sdk } = await import("snowflake-sdk");
-  sdk.configure({ logLevel:"OFF" });
-  const connection = sdk.createConnection({ account:e.SNOWFLAKE_ACCOUNT, username:e.SNOWFLAKE_USERNAME, password:e.SNOWFLAKE_APP_TOKEN, authenticator:"SNOWFLAKE", warehouse:e.SNOWFLAKE_WAREHOUSE, role:e.SNOWFLAKE_APP_ROLE, timeout:15000, clientSessionKeepAlive:false });
+  return poolState.terplinkPool ||= import("snowflake-sdk").then(({ default: sdk }) => {
+    sdk.configure({ logLevel:"OFF" });
+    return sdk.createPool({ account:e.SNOWFLAKE_ACCOUNT!, username:e.SNOWFLAKE_USERNAME!, password:e.SNOWFLAKE_APP_TOKEN!, authenticator:"SNOWFLAKE", warehouse:e.SNOWFLAKE_WAREHOUSE!, role:e.SNOWFLAKE_APP_ROLE!, timeout:15000, clientSessionKeepAlive:true }, { min:1, max:8, acquireTimeoutMillis:20000, testOnBorrow:true, evictionRunIntervalMillis:60000, idleTimeoutMillis:30*60000 });
+  }).catch(error => { poolState.terplinkPool = undefined; throw error; });
+}
+export async function withDatabase<T>(work: (query: Query) => Promise<T>): Promise<T> {
+  const connections = await pool();
+  let connection: Connection;
+  try { connection = await connections.acquire(); } catch { throw new Error("Database connection failed."); }
   let closed = false;
   let statement: RowStatement | undefined;
   const query: Query = (sqlText, binds=[]) => new Promise((resolve,reject)=> {
@@ -22,14 +31,21 @@ export async function withDatabase<T>(work: (query: Query) => Promise<T>): Promi
     catch { reject(new Error("Database query failed.")); }
   });
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<never>((_resolve,reject)=> { timer=setTimeout(()=> { closed=true; statement?.cancel(()=>{}); connection.destroy(()=>{}); reject(new Error("Database request timed out.")); },60000); });
+  const deadline = new Promise<never>((_resolve,reject)=> { timer=setTimeout(()=> { closed=true; statement?.cancel(()=>{}); reject(new Error("Database request timed out.")); },60000); });
+  let healthy = false;
   try {
-    return await Promise.race([deadline, (async()=> {
-      await new Promise<void>((resolve,reject)=> connection.connect(error=> { if (closed || error) { reject(new Error("Database connection failed.")); return; } resolve(); }));
-      await query("ALTER SESSION SET TIMEZONE = 'UTC'");
+    const result = await Promise.race([deadline, (async()=> {
+      if (!readySessions.has(connection)) { await query("ALTER SESSION SET TIMEZONE = 'UTC'"); readySessions.add(connection); }
       return work(query);
     })()]);
-  } finally { closed=true; clearTimeout(timer); connection.destroy(()=>{}); }
+    healthy = true;
+    return result;
+  } finally {
+    closed=true; clearTimeout(timer);
+    // A failed or timed-out session may still hold an open transaction, so it is never reused.
+    if (healthy) void connections.release(connection).catch(()=>{});
+    else void connections.destroy(connection).catch(()=>{});
+  }
 }
 export async function transaction<T>(q: Query, work: () => Promise<T>): Promise<T> {
   await q("BEGIN TRANSACTION");

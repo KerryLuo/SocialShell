@@ -27,7 +27,7 @@ export function SwipeCard({ item, next, onDecision, canUndo, onUndo }: { item: C
     setExiting(true);
     const distance = Math.max(window.innerWidth, 600);
     setOffset(decision === "interested" ? distance : -distance);
-    // In live mode the server must confirm before the card is gone; a failed save brings it back.
+    // The deck advances right away; a swipe that can't be recorded locally brings the card back.
     timer.current = setTimeout(async () => {
       if (!await onDecision(decision)) {
         busy.current = false;

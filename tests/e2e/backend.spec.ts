@@ -44,3 +44,18 @@ test("backend API keeps local mode explicit and rejects writes when disabled",as
  const state=await request.get("/api/state");expect(state.status()).toBe(200);expect(await state.json()).toEqual({mode:"local"});
  for(const endpoint of ["items","profile","swipes","reset"]){const response=await request.post(`/api/${endpoint}`,{data:{}});expect(response.status()).toBe(503);expect(await response.json()).toHaveProperty("error");}
 });
+test("live swipes advance without waiting for Snowflake and roll back if the save fails",async({page})=>{
+ const second:CampusItem={...item,id:"snowflake:group:23",title:"Second Club"};
+ const state={...freshDemo(),items:[item,second]};
+ await page.route("**/api/state",route=>route.fulfill({json:{mode:"snowflake",state}}));
+ let release!:()=>void;const slow=new Promise<void>(resolve=>{release=resolve;});
+ await page.route("**/api/swipes",async route=>{await slow;await route.fulfill({status:502,json:{error:"Swipe could not be saved."}});});
+ await page.goto("/discover");
+ await expect(page.getByRole("heading",{name:item.title})).toBeVisible();
+ await page.getByRole("button",{name:"Interested",exact:true}).click();
+ // The server has not answered yet, but the next card is already up.
+ await expect(page.getByRole("heading",{name:second.title})).toBeVisible();
+ release();
+ await expect(page.getByText("Swipe could not be saved.")).toBeVisible();
+ await expect(page.getByRole("heading",{name:item.title})).toBeVisible();
+});
