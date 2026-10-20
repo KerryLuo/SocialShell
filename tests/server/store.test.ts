@@ -21,9 +21,12 @@ test("profile changes and tag relationships commit together and bind user text",
 });
 test("swipe ownership comes from the session user and only catalog IDs are accepted",async()=> {
  const calls:{sql:string;binds:unknown}[]=[];
- const q:Query=async(sql,binds)=>{calls.push({sql,binds});return sql.startsWith("SELECT")?[{ITEM_ID:"group:1"}]:[];};
+ const q:Query=async(sql,binds)=>{calls.push({sql,binds});return [{"number of rows inserted":(binds as string[])[2]==="group:1"?1:0,"number of rows updated":0}];};
  await saveDecision(q,"27","snowflake:group:1","interested");
- assert.deepEqual(calls.at(-1)?.binds,["27","group:1","interested"]);
+ assert.equal(calls.length,1);
+ assert.ok(calls[0].sql.includes("DISCOVERY_CATALOG"));
+ assert.deepEqual(calls[0].binds,["27","interested","group:1","UMD"]);
+ await assert.rejects(saveDecision(q,"27","snowflake:group:2","pass"));
  await assert.rejects(saveDecision(q,"27","demo-1","pass"));
 });
 const row={ITEM_ID:"group:9",ITEM_TYPE:"group",TITLE:"My Club",DESCRIPTION:"Coding",TAGS:"AI",CAMPUS:"UMD",STARTS_AT:null,IS_ACTIVE:1,IS_DEMO:false,LOCATION:"Iribe",MEETING_DETAILS:"Fridays",CREATED_AT:"2026-10-04T12:00:00Z"};

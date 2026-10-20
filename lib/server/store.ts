@@ -11,7 +11,11 @@ const numberId = (value: unknown) => {
   if(!/^[1-9]\d*$/.test(text))throw new Error("Invalid stored ID.");
   return text;
 };
+// Guest users are never deleted (reset keeps the row), so a resolved ID stays valid for this server's lifetime.
+const userCache=(globalThis as typeof globalThis & { terplinkUserIds?: Map<string,string> }).terplinkUserIds ||= new Map<string,string>();
 export async function ensureUser(q:Query, guestKey:string) {
+  const cached=userCache.get(guestKey);
+  if(cached)return cached;
   await q(`INSERT INTO ${P()}.USERS (APP_USER_KEY,NAME,USERNAME) SELECT ?,'New student',? WHERE NOT EXISTS (SELECT 1 FROM ${P()}.USER_IDENTITIES WHERE APP_USER_KEY=?)`,[guestKey,guestKey,guestKey]);
   const rows=await q(`SELECT USER_ID FROM ${P()}.USER_IDENTITIES WHERE APP_USER_KEY=?`,[guestKey]);
   if(rows.length!==1)throw new Error("Guest identity is ambiguous.");
@@ -19,6 +23,7 @@ export async function ensureUser(q:Query, guestKey:string) {
   const defaults=freshDemo().profile;
   // Profile initialization is idempotent; an existing profile is never overwritten.
   await q(`MERGE INTO ${P()}.PROFILES t USING (SELECT ? AS U) s ON t.USER_ID=s.U WHEN NOT MATCHED THEN INSERT (USER_ID,NAME,MAJOR,BIO,AVAILABILITY) VALUES(s.U,?,?,?,?)`,[userId,defaults.name,defaults.major,defaults.bio,defaults.availability]);
+  userCache.set(guestKey,userId);
   return userId;
 }
 async function profileId(q:Query,userId:string) {
@@ -62,9 +67,10 @@ export async function readState(q:Query,userId:string):Promise<DemoState> {
 export async function saveDecision(q:Query,userId:string,id:string,action:Decision) {
   const item=catalogIdentity(id);
   const rawId=`${item.kind}:${item.numericId}`;
-  const rows=await q(`SELECT ITEM_ID FROM ${P()}.DISCOVERY_CATALOG WHERE ITEM_ID=? AND CAMPUS=?`,[rawId,campus()]);
-  if(rows.length!==1)throw new Error("Card not found.");
-  await q(`MERGE INTO ${P()}.SWIPES t USING (SELECT ? AS U,? AS I,? AS A) s ON t.USER_ID=s.U AND t.ITEM_ID=s.I WHEN MATCHED THEN UPDATE SET ACTION=s.A,SWIPED_AT=CURRENT_TIMESTAMP() WHEN NOT MATCHED THEN INSERT(USER_ID,ITEM_ID,ACTION) VALUES(s.U,s.I,s.A)`,[userId,rawId,action]);
+  // One round trip: the catalog check is the MERGE source, so an unknown card changes nothing.
+  const rows=await q(`MERGE INTO ${P()}.SWIPES t USING (SELECT ? AS U,ITEM_ID AS I,? AS A FROM ${P()}.DISCOVERY_CATALOG WHERE ITEM_ID=? AND CAMPUS=?) s ON t.USER_ID=s.U AND t.ITEM_ID=s.I WHEN MATCHED THEN UPDATE SET ACTION=s.A,SWIPED_AT=CURRENT_TIMESTAMP() WHEN NOT MATCHED THEN INSERT(USER_ID,ITEM_ID,ACTION) VALUES(s.U,s.I,s.A)`,[userId,action,rawId,campus()]);
+  const changed=Object.values(rows[0] || {}).reduce<number>((sum,value)=>sum+Number(value || 0),0);
+  if(changed!==1)throw new Error("Card not found.");
 }
 /** Undo a swipe (the Discover "go back" button). Deleting a missing row is a no-op. */
 export async function clearDecision(q:Query,userId:string,id:string) {

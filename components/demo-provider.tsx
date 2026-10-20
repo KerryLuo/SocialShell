@@ -29,10 +29,10 @@ interface DemoContextValue {
 }
 const DemoContext = createContext<DemoContextValue | null>(null);
 
-async function api(path: string, body?: unknown) {
+async function api(path: string, body?: unknown, keepalive = false) {
   const response = await fetch(path, body === undefined
     ? { cache: "no-store" }
-    : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), keepalive });
   const result = await response.json();
   if (!response.ok) throw new Error(result.error || "The server could not save this change.");
   return result;
@@ -52,6 +52,9 @@ export function DemoProvider({ children }: { children: ReactNode }) {
   // One idempotency key per draft, so retrying a failed publish never creates a duplicate.
   const attempts = useRef(new Map<string, string>());
   const initialRequest = useRef<ReturnType<typeof api> | null>(null);
+  // Live swipes are shown at once and saved here in order; other writes wait for this queue to drain.
+  const swipeQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const queued = useRef(0);
 
   function publishState(next: DemoState) {
     current.current = next;
@@ -98,14 +101,47 @@ export function DemoProvider({ children }: { children: ReactNode }) {
     locked.current = true;
     setPending(true);
     try {
+      await swipeQueue.current;
       return await work();
     } catch (err) {
       setError(err instanceof Error ? err.message : "The change could not be saved.");
       return false;
     } finally {
       locked.current = false;
-      setPending(false);
+      setPending(queued.current > 0);
     }
+  }
+
+  /**
+   * Swipes update the deck immediately so the next card never waits on Snowflake.
+   * The write is queued behind earlier swipes; if it fails, the card's previous decision comes back with an error.
+   */
+  function swipe(id: string, decision: Decision | "clear") {
+    if (locked.current || !current.current) return false;
+    const before = current.current.decisions[id];
+    const { [id]: _removed, ...rest } = current.current.decisions;
+    if (!commit({ ...current.current, decisions: decision === "clear" ? rest : { ...rest, [id]: decision } })) return false;
+    if (!live.current) return true;
+    queued.current++;
+    setPending(true);
+    swipeQueue.current = swipeQueue.current.then(async () => {
+      try {
+        // keepalive lets a queued swipe finish even if the student navigates away right after.
+        await api("/api/swipes", { id, decision }, true);
+      } catch (err) {
+        const latest = current.current;
+        // Only roll back if nothing newer has changed this card since.
+        if (latest && (latest.decisions[id] ?? "clear") === decision) {
+          const { [id]: _failed, ...others } = latest.decisions;
+          publishState({ ...latest, decisions: before ? { ...others, [id]: before } : others });
+        }
+        setError(err instanceof Error ? err.message : "Your swipe could not be saved.");
+      } finally {
+        queued.current--;
+        if (!queued.current && !locked.current) setPending(false);
+      }
+    });
+    return true;
   }
 
   const value: DemoContextValue = {
@@ -125,19 +161,8 @@ export function DemoProvider({ children }: { children: ReactNode }) {
         return commit({ ...current.current!, items: mergeSearchCards(current.current!.items, [item]) });
       });
     },
-    decide(id, decision) {
-      return change(async () => {
-        if (live.current) await api("/api/swipes", { id, decision });
-        return commit({ ...current.current!, decisions: { ...current.current!.decisions, [id]: decision } });
-      });
-    },
-    undoDecision(id) {
-      return change(async () => {
-        if (live.current) await api("/api/swipes", { id, decision: "clear" });
-        const { [id]: _removed, ...decisions } = current.current!.decisions;
-        return commit({ ...current.current!, decisions });
-      });
-    },
+    decide: async (id, decision) => swipe(id, decision),
+    undoDecision: async id => swipe(id, "clear"),
     saveProfile(profile) {
       return change(async () => {
         if (live.current) await api("/api/profile", profile);
