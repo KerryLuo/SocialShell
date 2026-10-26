@@ -1,4 +1,4 @@
-# TerpLink
+# SocialShell
 
 Team 3 · `hacktoberfest_oct_2027`
 
